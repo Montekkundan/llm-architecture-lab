@@ -4,7 +4,7 @@ This is the student concept project for course lessons **31–50**. It starts
 from a tiny decoder resembling the course's PicoLLM, then selects attention,
 position, and FFN mechanisms through a versioned `ModelSpec`. The current
 implementation includes adjacent-pair RoPE, fixed-scale YaRN, pre-RMSNorm,
-SwiGLU or top-k MoE, causal MHA/MQA/GQA or unabsorbed MLA, and their caches.
+SwiGLU or top-k MoE, causal MHA/MQA/GQA or MLA, and their caches.
 It is a reference implementation
 for understanding shapes and correctness; it is not a fast training kernel.
 
@@ -20,6 +20,8 @@ python -m architecture_lab.checks --preset pico-gqa
 python -m architecture_lab.checks --preset pico-mqa
 python -m architecture_lab.checks --preset pico-yarn
 python -m architecture_lab.checks --preset pico-mla
+python -m architecture_lab.checks --preset pico-mla-absorbed
+python -m architecture_lab.checks --preset pico-mla-yarn-moe
 python -m architecture_lab.checks --preset pico-moe
 ```
 
@@ -32,7 +34,7 @@ with `PYTHONPATH=src python3 -m unittest discover -s tests -p test_spec.py -v`.
 ```python
 from architecture_lab import build_model, preset
 
-spec = preset("pico-gqa")  # also pico-dense, pico-mqa, pico-yarn, pico-mla, pico-moe
+spec = preset("pico-gqa")  # change to any teaching preset listed by checks --help
 model = build_model(spec)
 print(spec.to_dict(), spec.attention_kind)
 ```
@@ -73,7 +75,10 @@ causal, cache, frequency, routing and weight-conservation checks on CPU.
 the default, so existing version-1 spec dictionaries still load. An MLA spec
 uses `kv_heads=heads` as a reserved legacy field, while `kv_cache_bytes` counts
 its shared latent and positional key. A custom spec can combine MLA and MoE
-without changing the decoder's logits API.
+without changing the decoder's logits API. `pico-mla-absorbed` swaps only the
+cached inference algebra. `pico-mla-yarn-moe` combines fixed-scale YaRN on
+MLA's decoupled positional path with sparse routed experts. Both remain small
+teaching models rather than DeepSeek-V2 reproductions.
 
 ```python
 import torch
@@ -108,10 +113,15 @@ experiments, not validated here as universal settings.
 
 `LatentAttention` implements low-rank Q and joint KV projections, a shared
 decoupled RoPE key, causal masking, and a cache of KV latents plus positional
-keys. For clarity it **reconstructs** content K and V from the whole cached
-latent on each call. It does not implement DeepSeek-V2's absorbed inference
-weights, fused kernels, full architecture, checkpoint compatibility, or
-published KV reduction measurements. Its standalone `LatentCache` has no
+keys. The default path reconstructs content K and V from cached latents.
+With `mla_inference_mode="absorbed"`, eval-mode cached inference instead
+computes `qᵀW_UK c` and `W_O W_UV Σp c`, so neither reconstructed content K
+nor V is formed. Double-precision tests compare both paths, including chunked
+caches. MLA can apply fixed-scale YaRN to the decoupled positional Q/K only;
+the content path remains unrotated. This is an algebraic CPU reference, not a
+latency benchmark or optimized kernel. It omits the full DeepSeek-V2
+architecture, checkpoint compatibility, and published KV reduction
+measurements. Its standalone `LatentCache` has no
 model-owner/parameter-version guard; use it only with the same unchanged
 module and exact token prefix. The whole `DecoderLM` applies those cache guards.
 
@@ -146,9 +156,9 @@ claimed here.
   stated in Meta's [model card](https://github.com/meta-llama/llama-models/blob/main/models/llama3/MODEL_CARD.md).
 - Peng et al., [YaRN: Efficient Context Window Extension of Large Language Models](https://arxiv.org/pdf/2309.00071), sections 3.2–3.4:
   NTK-by-parts frequency ramp, attention scaling, and the dynamic-cache caveat.
-- DeepSeek-AI, [DeepSeek-V2](https://arxiv.org/pdf/2405.04434), section 2.1:
-  low-rank KV compression and decoupled positional key. This reference omits
-  its inference weight absorption.
+- DeepSeek-AI, [DeepSeek-V2](https://arxiv.org/pdf/2405.04434), section 2.1,
+  equations 9–19: low-rank KV compression, decoupled positional key, and
+  algebraic inference weight absorption.
 - Lepikhin et al., [GShard](https://arxiv.org/abs/2006.16668): sparse expert
   selection and conditional computation motivation. This router is a small
   teaching variant, not a reproduction of its sharding or capacity policy.

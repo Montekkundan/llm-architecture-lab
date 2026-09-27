@@ -69,7 +69,7 @@ class DecoderTests(unittest.TestCase):
         from architecture_lab.attention import LatentCache
         from architecture_lab.position import YarnRoPE
 
-        for name in ("pico-yarn", "pico-mla", "pico-moe"):
+        for name in ("pico-yarn", "pico-mla", "pico-mla-absorbed", "pico-mla-yarn-moe", "pico-moe"):
             with self.subTest(name=name):
                 spec = preset(name)
                 model = build_model(spec).eval()
@@ -84,7 +84,7 @@ class DecoderTests(unittest.TestCase):
                 cache.assert_prefix(ids)
                 if name == "pico-yarn":
                     self.assertIsInstance(model.blocks[0].attention.yarn, YarnRoPE)
-                if name == "pico-mla":
+                if spec.attention_mode == "mla":
                     self.assertTrue(all(isinstance(layer, LatentCache) for layer in cache.layers))
                     self.assertEqual(tuple(cache.layers[0].latent.shape), (2, 7, spec.mla_kv_rank))
                     payload = sum(layer.latent.numel() + layer.positional_keys.numel()
@@ -92,9 +92,12 @@ class DecoderTests(unittest.TestCase):
                     self.assertEqual(payload, kv_cache_bytes(spec, 2, 7, 4))
                 if name == "pico-moe":
                     self.assertEqual(len(model.blocks[0].ffn.experts), spec.moe_experts)
+                if name == "pico-mla-yarn-moe":
+                    self.assertIsInstance(model.blocks[0].attention.yarn, YarnRoPE)
+                    self.assertEqual(len(model.blocks[0].ffn.experts), spec.moe_experts)
 
     def test_combined_mla_moe_spec_has_finite_gradients_and_cache_guard(self):
-        model = build_model(replace(preset("pico-mla"), name="pico-mla-moe",
+        model = build_model(replace(preset("pico-mla-absorbed"), name="pico-mla-moe",
                                     ffn_mode="moe", moe_experts=4, moe_top_k=2))
         ids = torch.tensor([[1, 2, 3, 4]], dtype=torch.long)
         logits = model(ids)
@@ -107,6 +110,14 @@ class DecoderTests(unittest.TestCase):
             model.token_embedding.weight[0, 0] += 1
         with self.assertRaisesRegex(ValueError, "changed parameters"):
             model.forward_cached(ids[:, 2:], cache)
+
+    def test_combined_mla_yarn_moe_is_causal(self):
+        model = build_model(preset("pico-mla-yarn-moe")).eval()
+        ids = torch.tensor([[1, 2, 3, 4, 5]], dtype=torch.long)
+        changed = ids.clone()
+        changed[:, 3:] = 8
+        torch.testing.assert_close(model(ids)[:, :3], model(changed)[:, :3],
+                                   rtol=1e-6, atol=1e-6)
 
     def test_yarn_cache_crosses_original_context(self):
         spec = preset("pico-yarn")

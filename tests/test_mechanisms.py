@@ -1,5 +1,6 @@
 import math
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -59,6 +60,35 @@ class MechanismTests(unittest.TestCase):
             torch.testing.assert_close(prefix[:, :4], full[:, :4], rtol=1e-12, atol=1e-12)
             with self.assertRaises(ValueError):
                 model(x[:1, 3:4], cache, use_cache=True)
+
+    def test_absorbed_mla_matches_reconstruction_without_up_projecting_cached_kv(self):
+        model = LatentAttention(16, 4, 4, 4, kv_rank=6, query_rank=8,
+                                inference_mode="absorbed").double().eval()
+        x = torch.randn(2, 7, 16, dtype=torch.float64)
+        with torch.no_grad():
+            expected, _ = model(x)
+            with patch.object(model.k_content, "forward", side_effect=AssertionError("materialized K")), \
+                 patch.object(model.v_content, "forward", side_effect=AssertionError("materialized V")):
+                chunks = []
+                cache = None
+                for start, stop in ((0, 3), (3, 5), (5, 7)):
+                    output, cache = model(x[:, start:stop], cache, use_cache=True)
+                    chunks.append(output)
+            torch.testing.assert_close(torch.cat(chunks, dim=1), expected, rtol=1e-12, atol=1e-12)
+            self.assertEqual(tuple(cache.latent.shape), (2, 7, 6))
+            self.assertEqual(tuple(cache.positional_keys.shape), (2, 1, 7, 4))
+
+    def test_mla_yarn_and_absorption_match_full_sequence(self):
+        model = LatentAttention(16, 4, 4, 4, kv_rank=6, query_rank=8,
+                                inference_mode="absorbed", yarn_original_context=4,
+                                yarn_scale=2).double().eval()
+        x = torch.randn(1, 7, 16, dtype=torch.float64)
+        with torch.no_grad():
+            expected, _ = model(x)
+            first, cache = model(x[:, :4], use_cache=True)
+            second, cache = model(x[:, 4:], cache, use_cache=True)
+            torch.testing.assert_close(torch.cat((first, second), dim=1), expected,
+                                       rtol=1e-12, atol=1e-12)
 
     def test_moe_dispatch_conserves_weight_and_has_gradients(self):
         moe = TopKMoE(width=8, ff_width=12, experts=4, top_k=2).double()

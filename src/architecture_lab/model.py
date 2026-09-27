@@ -146,6 +146,9 @@ class DecoderBlock(nn.Module):
                 spec.width, spec.heads, spec.mla_content_width,
                 spec.mla_positional_width, spec.mla_kv_rank,
                 spec.mla_query_rank, rope_base=spec.rope_base,
+                inference_mode=spec.mla_inference_mode,
+                yarn_original_context=spec.yarn_original_context,
+                yarn_scale=spec.yarn_scale,
             )
         else:
             self.attention = CausalAttention(spec)

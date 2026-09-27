@@ -34,6 +34,7 @@ class ModelSpec:
     mla_positional_width: int = 0
     mla_kv_rank: int = 0
     mla_query_rank: int = 0
+    mla_inference_mode: str = "reconstruct"
     ffn_mode: str = "swiglu"
     moe_experts: int = 0
     moe_top_k: int = 0
@@ -77,13 +78,13 @@ class ModelSpec:
         mla_fields = (self.mla_content_width, self.mla_positional_width,
                       self.mla_kv_rank, self.mla_query_rank)
         if self.attention_mode == "standard":
-            if any(mla_fields):
+            if any(mla_fields) or self.mla_inference_mode != "reconstruct":
                 raise ValueError("Standard attention cannot carry MLA dimensions")
         elif self.attention_mode == "mla":
             if (any(type(value) is not int or value <= 0 for value in mla_fields)
                     or self.mla_positional_width % 2 or self.kv_heads != self.heads
-                    or self.position_mode != "rope"):
-                raise ValueError("MLA needs positive ranks, even positional width, and decoupled RoPE")
+                    or self.mla_inference_mode not in {"reconstruct", "absorbed"}):
+                raise ValueError("MLA needs positive ranks, even positional width, and a valid inference mode")
         else:
             raise ValueError("attention_mode must be standard or mla")
         if self.ffn_mode == "swiglu":
@@ -146,6 +147,18 @@ PRESETS: dict[str, ModelSpec] = {
                         mla_content_width=16, mla_positional_width=8,
                         mla_kv_rank=16, mla_query_rank=32,
                         source_url="https://arxiv.org/abs/2405.04434"),
+    "pico-mla-absorbed": replace(_PICO, name="pico-mla-absorbed", attention_mode="mla",
+                                 mla_content_width=16, mla_positional_width=8,
+                                 mla_kv_rank=16, mla_query_rank=32,
+                                 mla_inference_mode="absorbed",
+                                 source_url="https://arxiv.org/abs/2405.04434"),
+    "pico-mla-yarn-moe": replace(_PICO, name="pico-mla-yarn-moe", attention_mode="mla",
+                                 mla_content_width=16, mla_positional_width=8,
+                                 mla_kv_rank=16, mla_query_rank=32,
+                                 mla_inference_mode="absorbed", position_mode="yarn",
+                                 context=512, yarn_original_context=128, yarn_scale=4.0,
+                                 ffn_mode="moe", moe_experts=4, moe_top_k=2,
+                                 source_url="https://arxiv.org/abs/2405.04434"),
     "pico-moe": replace(_PICO, name="pico-moe", ffn_mode="moe",
                         moe_experts=4, moe_top_k=2,
                         source_url="https://arxiv.org/abs/2006.16668"),
