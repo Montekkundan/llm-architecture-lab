@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "llm-architecture-lab"
+version = "0.1.0"
+description = "A small, auditable architecture lab for LLM course lessons 31–50"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["torch>=2.3"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
