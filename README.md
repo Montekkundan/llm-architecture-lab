@@ -58,14 +58,70 @@ future tokens cannot change earlier outputs, and backpropagate through all
 parameters. A cache belongs to one unchanged model and token prefix. These
 are numerical and structural tests, not performance measurements.
 
+## Independent mechanism references
+
+These modules are **not yet wired into `ModelSpec` or `DecoderLM` presets**.
+They are small, importable experiments for lessons 34, 36, and 44. Run
+`PYTHONPATH=src python -m unittest discover -s tests -v` after installing
+PyTorch. The tests include forward/backward, causal, cache, frequency, routing
+and weight-conservation checks on CPU.
+
+```python
+import torch
+from architecture_lab.position import YarnRoPE
+from architecture_lab.attention import LatentAttention
+from architecture_lab.moe import TopKMoE
+
+rope = YarnRoPE(head_width=16, original_context=4096, scale=4)
+q = torch.randn(1, 4, 8, 16)
+rotated_q = rope(q, torch.arange(8))
+
+mla = LatentAttention(width=16, heads=4, content_width=4,
+                      positional_width=4, kv_rank=6, query_rank=8).eval()
+x = torch.randn(1, 8, 16)
+full, _ = mla(x)
+first, cache = mla(x[:, :4], use_cache=True)
+last, cache = mla(x[:, 4:], cache, use_cache=True)
+torch.testing.assert_close(full, torch.cat((first, last), dim=1))
+
+moe = TopKMoE(width=16, ff_width=32, experts=4, top_k=2)
+output, routing = moe(x)
+assert routing.counts.sum().item() == 2 * x.shape[0] * x.shape[1]
+```
+
+`YarnRoPE` implements a **fixed** scale: the paper's NTK-by-parts frequency
+ramp using rotations in the original context, plus its attention multiplier
+on both Q and K. It does not implement Dynamic-YaRN, fine-tuning, or a
+length-extrapolation evaluation. Fix the scale for a cached decode; changing
+it mid-cache would require re-rotating earlier keys. The paper's suggested
+`alpha=1`, `beta=32`, and attention formula were fitted for LLaMA-family
+experiments, not validated here as universal settings.
+
+`LatentAttention` implements low-rank Q and joint KV projections, a shared
+decoupled RoPE key, causal masking, and a cache of KV latents plus positional
+keys. For clarity it **reconstructs** content K and V from the whole cached
+latent on each call. It does not implement DeepSeek-V2's absorbed inference
+weights, fused kernels, full architecture, checkpoint compatibility, or
+published KV reduction measurements. Its standalone `LatentCache` has no
+model-owner/parameter-version guard; use it only with the same unchanged
+module and exact token prefix.
+
+`TopKMoE` computes selected-expert softmax weights, normalizes them to one
+per token, and dispatches each token to `top_k` SwiGLU experts. No token is
+dropped. It has no shared expert, capacity limit, distributed all-to-all,
+load-balancing loss, or router stability training recipe. With `top_k=1`,
+normalizing only the selected logit makes the gate weight exactly one and
+gives the router no task-loss gradient; use `top_k=2` for this gradient demo.
+Top-k selection itself is discrete, so gradients flow through selected
+logits, not through the choice of expert index.
+
 ## Scope and next lessons
 
-YaRN, MLA, sliding/sparse/linear attention, MoE, FlashAttention, FP8 and
-distributed execution are **not implemented** in this starter. Their
-lessons have file and test targets in `LESSON_MAP.md`; those targets become
-complete only after their derivations, operators, backward passes, cache
-contracts, source citations and tests are added. No benchmark or published
-model parity is claimed here.
+Fixed-scale YaRN, a readable MLA core, and sparse top-k dispatch now have
+standalone CPU references. Sliding/sparse/linear attention, shared-expert
+balancing, FlashAttention, FP8 and distributed execution remain future work.
+See [lesson map](LESSON_MAP.md). No benchmark or published-model parity is
+claimed here.
 
 ## Primary sources
 
@@ -79,6 +135,13 @@ model parity is claimed here.
   and [model code](https://github.com/meta-llama/llama-models/blob/main/models/llama3/model.py):
   published 8B dimensions and SwiGLU width derivation. The 8K context is
   stated in Meta's [model card](https://github.com/meta-llama/llama-models/blob/main/models/llama3/MODEL_CARD.md).
+- Peng et al., [YaRN: Efficient Context Window Extension of Large Language Models](https://arxiv.org/pdf/2309.00071), sections 3.2–3.4:
+  NTK-by-parts frequency ramp, attention scaling, and the dynamic-cache caveat.
+- DeepSeek-AI, [DeepSeek-V2](https://arxiv.org/pdf/2405.04434), section 2.1:
+  low-rank KV compression and decoupled positional key. This reference omits
+  its inference weight absorption.
+- Lepikhin et al., [GShard](https://arxiv.org/abs/2006.16668): sparse expert
+  selection and conditional computation motivation. This router is a small
+  teaching variant, not a reproduction of its sharding or capacity policy.
 
-No external model weights or datasets are bundled. This directory has no
-GitHub remote and has not been published.
+No external model weights or datasets are bundled.
