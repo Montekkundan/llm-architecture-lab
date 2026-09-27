@@ -8,12 +8,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
 from torch.nn import functional as F
 
 from .spec import ModelSpec
+
+if TYPE_CHECKING:
+    from .attention.mla import LatentCache
 
 
 def apply_rope(x: torch.Tensor, positions: torch.Tensor, base: float) -> torch.Tensor:
@@ -63,7 +67,7 @@ class LayerCache:
 
 @dataclass(frozen=True)
 class ModelCache:
-    layers: tuple[LayerCache, ...]
+    layers: tuple[LayerCache | LatentCache, ...]
     tokens: torch.Tensor
     owner: int
     parameter_versions: tuple[int, ...]
@@ -80,6 +84,11 @@ class CausalAttention(nn.Module):
         self.kv_heads = spec.kv_heads
         self.head_width = spec.head_width
         self.rope_base = spec.rope_base
+        self.yarn = None
+        if spec.position_mode == "yarn":
+            from .position import YarnRoPE
+            self.yarn = YarnRoPE(spec.head_width, spec.yarn_original_context,
+                                 spec.yarn_scale, base=spec.rope_base)
         self.q_proj = nn.Linear(spec.width, spec.width, bias=False)
         self.k_proj = nn.Linear(spec.width, spec.kv_heads * spec.head_width, bias=False)
         self.v_proj = nn.Linear(spec.width, spec.kv_heads * spec.head_width, bias=False)
@@ -101,8 +110,12 @@ class CausalAttention(nn.Module):
         q = self._split(self.q_proj(x), self.heads, self.head_width)
         k = self._split(self.k_proj(x), self.kv_heads, self.head_width)
         v = self._split(self.v_proj(x), self.kv_heads, self.head_width)
-        q = apply_rope(q, positions, self.rope_base)
-        k = apply_rope(k, positions, self.rope_base)
+        if self.yarn is None:
+            q = apply_rope(q, positions, self.rope_base)
+            k = apply_rope(k, positions, self.rope_base)
+        else:
+            q = self.yarn(q, positions)
+            k = self.yarn(k, positions)
         if past is not None:
             k = torch.cat((past.keys, k), dim=-2)
             v = torch.cat((past.values, v), dim=-2)
@@ -124,21 +137,41 @@ class CausalAttention(nn.Module):
 class DecoderBlock(nn.Module):
     def __init__(self, spec: ModelSpec):
         super().__init__()
+        self.attention_mode = spec.attention_mode
+        self.ffn_mode = spec.ffn_mode
         self.attention_norm = RMSNorm(spec.width, spec.eps)
-        self.attention = CausalAttention(spec)
+        if spec.attention_mode == "mla":
+            from .attention import LatentAttention
+            self.attention = LatentAttention(
+                spec.width, spec.heads, spec.mla_content_width,
+                spec.mla_positional_width, spec.mla_kv_rank,
+                spec.mla_query_rank, rope_base=spec.rope_base,
+            )
+        else:
+            self.attention = CausalAttention(spec)
         self.ffn_norm = RMSNorm(spec.width, spec.eps)
-        self.ffn = SwiGLU(spec.width, spec.ff_width)
+        if spec.ffn_mode == "moe":
+            from .moe import TopKMoE
+            self.ffn = TopKMoE(spec.width, spec.ff_width, spec.moe_experts, spec.moe_top_k)
+        else:
+            self.ffn = SwiGLU(spec.width, spec.ff_width)
 
     def forward(
         self,
         x: torch.Tensor,
         positions: torch.Tensor,
-        past: LayerCache | None = None,
+        past: LayerCache | LatentCache | None = None,
         use_cache: bool = False,
-    ) -> tuple[torch.Tensor, LayerCache | None]:
-        attention_output, next_cache = self.attention(self.attention_norm(x), positions, past, use_cache)
+    ) -> tuple[torch.Tensor, LayerCache | LatentCache | None]:
+        if self.attention_mode == "mla":
+            attention_output, next_cache = self.attention(self.attention_norm(x), past, use_cache=use_cache)
+        else:
+            attention_output, next_cache = self.attention(self.attention_norm(x), positions, past, use_cache)
         x = x + attention_output
-        return x + self.ffn(self.ffn_norm(x)), next_cache
+        ffn_output = self.ffn(self.ffn_norm(x))
+        if self.ffn_mode == "moe":
+            ffn_output, _ = ffn_output
+        return x + ffn_output, next_cache
 
 
 class DecoderLM(nn.Module):
@@ -177,7 +210,7 @@ class DecoderLM(nn.Module):
 
         positions = torch.arange(offset, offset + length, device=input_ids.device)
         x = self.token_embedding(input_ids)
-        next_layers: list[LayerCache] = []
+        next_layers: list[LayerCache | LatentCache] = []
         for index, block in enumerate(self.blocks):
             previous = cache.layers[index] if cache is not None else None
             x, next_layer = block(x, positions, previous, use_cache)

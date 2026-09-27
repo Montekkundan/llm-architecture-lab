@@ -1,6 +1,7 @@
 import unittest
+from dataclasses import replace
 
-from architecture_lab import build_model, preset
+from architecture_lab import build_model, kv_cache_bytes, preset
 
 try:
     import torch
@@ -63,6 +64,59 @@ class DecoderTests(unittest.TestCase):
             model.token_embedding.weight[0, 0] += 1
         with self.assertRaisesRegex(ValueError, "changed parameters"):
             model.forward_cached(ids[:, 2:], cache)
+
+    def test_mechanism_presets_match_chunked_cache(self):
+        from architecture_lab.attention import LatentCache
+        from architecture_lab.position import YarnRoPE
+
+        for name in ("pico-yarn", "pico-mla", "pico-moe"):
+            with self.subTest(name=name):
+                spec = preset(name)
+                model = build_model(spec).eval()
+                ids = torch.randint(0, spec.vocab_size, (2, 7), dtype=torch.long)
+                full = model(ids)
+                pieces = []
+                cache = None
+                for start, stop in ((0, 3), (3, 5), (5, 7)):
+                    logits, cache = model.forward_cached(ids[:, start:stop], cache)
+                    pieces.append(logits)
+                torch.testing.assert_close(full, torch.cat(pieces, dim=1), rtol=1e-5, atol=1e-5)
+                cache.assert_prefix(ids)
+                if name == "pico-yarn":
+                    self.assertIsInstance(model.blocks[0].attention.yarn, YarnRoPE)
+                if name == "pico-mla":
+                    self.assertTrue(all(isinstance(layer, LatentCache) for layer in cache.layers))
+                    self.assertEqual(tuple(cache.layers[0].latent.shape), (2, 7, spec.mla_kv_rank))
+                    payload = sum(layer.latent.numel() + layer.positional_keys.numel()
+                                  for layer in cache.layers) * cache.layers[0].latent.element_size()
+                    self.assertEqual(payload, kv_cache_bytes(spec, 2, 7, 4))
+                if name == "pico-moe":
+                    self.assertEqual(len(model.blocks[0].ffn.experts), spec.moe_experts)
+
+    def test_combined_mla_moe_spec_has_finite_gradients_and_cache_guard(self):
+        model = build_model(replace(preset("pico-mla"), name="pico-mla-moe",
+                                    ffn_mode="moe", moe_experts=4, moe_top_k=2))
+        ids = torch.tensor([[1, 2, 3, 4]], dtype=torch.long)
+        logits = model(ids)
+        logits.square().mean().backward()
+        self.assertTrue(torch.isfinite(model.blocks[0].attention.kv_down.weight.grad).all())
+        self.assertGreater(float(model.blocks[0].ffn.router.weight.grad.abs().sum()), 0)
+        model.eval()
+        _, cache = model.forward_cached(ids[:, :2])
+        with torch.no_grad():
+            model.token_embedding.weight[0, 0] += 1
+        with self.assertRaisesRegex(ValueError, "changed parameters"):
+            model.forward_cached(ids[:, 2:], cache)
+
+    def test_yarn_cache_crosses_original_context(self):
+        spec = preset("pico-yarn")
+        model = build_model(spec).eval()
+        ids = torch.randint(0, spec.vocab_size, (1, spec.yarn_original_context + 2))
+        full = model(ids)
+        first, cache = model.forward_cached(ids[:, :spec.yarn_original_context])
+        last, cache = model.forward_cached(ids[:, spec.yarn_original_context:], cache)
+        torch.testing.assert_close(full, torch.cat((first, last), dim=1), rtol=1e-5, atol=1e-5)
+        self.assertEqual(cache.layers[0].keys.shape[-2], ids.shape[1])
 
 
 if __name__ == "__main__":

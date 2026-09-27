@@ -1,10 +1,11 @@
 # LLM architecture lab
 
 This is the student concept project for course lessons **31–50**. It starts
-from a tiny decoder resembling the course's PicoLLM, then changes the number
-of stored key/value heads through a versioned `ModelSpec`. The current
-implementation includes adjacent-pair RoPE, pre-RMSNorm, SwiGLU, explicit
-causal MHA/MQA/GQA, and a grouped KV cache. It is a reference implementation
+from a tiny decoder resembling the course's PicoLLM, then selects attention,
+position, and FFN mechanisms through a versioned `ModelSpec`. The current
+implementation includes adjacent-pair RoPE, fixed-scale YaRN, pre-RMSNorm,
+SwiGLU or top-k MoE, causal MHA/MQA/GQA or unabsorbed MLA, and their caches.
+It is a reference implementation
 for understanding shapes and correctness; it is not a fast training kernel.
 
 ## Start
@@ -17,19 +18,21 @@ python -m unittest discover -s tests -v
 python -m architecture_lab.checks --preset pico-dense
 python -m architecture_lab.checks --preset pico-gqa
 python -m architecture_lab.checks --preset pico-mqa
+python -m architecture_lab.checks --preset pico-yarn
+python -m architecture_lab.checks --preset pico-mla
+python -m architecture_lab.checks --preset pico-moe
 ```
 
 If PyTorch is unavailable, the dependency-free specification tests still run
-with `PYTHONPATH=src python3 -m unittest discover -s tests -v`; model tests
-report `skipped` until PyTorch is installed. `python3 -m compileall -q src tests`
-performs syntax checking without PyTorch.
+with `PYTHONPATH=src python3 -m unittest discover -s tests -p test_spec.py -v`.
+`python3 -m compileall -q src tests` performs syntax checking without PyTorch.
 
 ## Change the model, keep the calling code
 
 ```python
 from architecture_lab import build_model, preset
 
-spec = preset("pico-gqa")  # or pico-dense, pico-mqa, llama3-8b-tiny
+spec = preset("pico-gqa")  # also pico-dense, pico-mqa, pico-yarn, pico-mla, pico-moe
 model = build_model(spec)
 print(spec.to_dict(), spec.attention_kind)
 ```
@@ -58,13 +61,19 @@ future tokens cannot change earlier outputs, and backpropagate through all
 parameters. A cache belongs to one unchanged model and token prefix. These
 are numerical and structural tests, not performance measurements.
 
-## Independent mechanism references
+## Selectable mechanism references
 
-These modules are **not yet wired into `ModelSpec` or `DecoderLM` presets**.
-They are small, importable experiments for lessons 34, 36, and 44. Run
+`pico-yarn`, `pico-mla`, and `pico-moe` select these same operators through
+`ModelSpec` and `DecoderLM`. They are small, importable experiments for lessons
+34, 36, and 44. Run
 `PYTHONPATH=src python -m unittest discover -s tests -v` after installing
-PyTorch. The tests include forward/backward, causal, cache, frequency, routing
-and weight-conservation checks on CPU.
+PyTorch. The tests include whole-model cached/full parity, forward/backward,
+causal, cache, frequency, routing and weight-conservation checks on CPU.
+`ModelSpec` rejects incomplete mechanism settings; its original fields remain
+the default, so existing version-1 spec dictionaries still load. An MLA spec
+uses `kv_heads=heads` as a reserved legacy field, while `kv_cache_bytes` counts
+its shared latent and positional key. A custom spec can combine MLA and MoE
+without changing the decoder's logits API.
 
 ```python
 import torch
@@ -104,7 +113,7 @@ latent on each call. It does not implement DeepSeek-V2's absorbed inference
 weights, fused kernels, full architecture, checkpoint compatibility, or
 published KV reduction measurements. Its standalone `LatentCache` has no
 model-owner/parameter-version guard; use it only with the same unchanged
-module and exact token prefix.
+module and exact token prefix. The whole `DecoderLM` applies those cache guards.
 
 `TopKMoE` computes selected-expert softmax weights, normalizes them to one
 per token, and dispatches each token to `top_k` SwiGLU experts. No token is
@@ -118,7 +127,7 @@ logits, not through the choice of expert index.
 ## Scope and next lessons
 
 Fixed-scale YaRN, a readable MLA core, and sparse top-k dispatch now have
-standalone CPU references. Sliding/sparse/linear attention, shared-expert
+selectable CPU teaching presets. Sliding/sparse/linear attention, shared-expert
 balancing, FlashAttention, FP8 and distributed execution remain future work.
 See [lesson map](LESSON_MAP.md). No benchmark or published-model parity is
 claimed here.

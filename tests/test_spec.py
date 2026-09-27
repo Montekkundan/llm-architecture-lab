@@ -36,6 +36,49 @@ class ModelSpecTests(unittest.TestCase):
         self.assertEqual(kv_cache_bytes(dense, 2, 7, 4), 2 * kv_cache_bytes(gqa, 2, 7, 4))
         self.assertEqual(kv_cache_bytes(dense, 2, 7, 4), 4 * kv_cache_bytes(mqa, 2, 7, 4))
 
+    def test_mechanism_presets_roundtrip_and_cache_accounting(self):
+        for name, kind in (("pico-yarn", "mha"), ("pico-mla", "mla"), ("pico-moe", "mha")):
+            with self.subTest(name=name):
+                spec = preset(name)
+                self.assertEqual(spec.attention_kind, kind)
+                self.assertEqual(ModelSpec.from_dict(spec.to_dict()), spec)
+        mla = preset("pico-mla")
+        self.assertEqual(
+            kv_cache_bytes(mla, 2, 7, 4),
+            mla.layers * 2 * 7 * (mla.mla_kv_rank + mla.mla_positional_width) * 4,
+        )
+        original = preset("pico-dense")
+        old_fields = {key: value for key, value in original.to_dict().items()
+                      if key not in {"position_mode", "yarn_original_context", "yarn_scale",
+                                     "attention_mode", "mla_content_width", "mla_positional_width",
+                                     "mla_kv_rank", "mla_query_rank", "ffn_mode",
+                                     "moe_experts", "moe_top_k"}}
+        self.assertEqual(ModelSpec.from_dict(old_fields), original)
+
+    def test_invalid_mechanism_combinations_are_rejected(self):
+        baseline = preset("pico-dense")
+        invalid = (
+            {"position_mode": "yarn"},
+            {"position_mode": "yarn", "yarn_original_context": 128, "yarn_scale": 2.0},
+            {"attention_mode": "mla"},
+            {"ffn_mode": "moe"},
+            {"ffn_mode": "moe", "moe_experts": 2, "moe_top_k": 3},
+            {"mla_kv_rank": 4},
+            {"position_mode": "unknown"},
+            {"attention_mode": "unknown"},
+            {"ffn_mode": "unknown"},
+            {"position_mode": "yarn", "yarn_original_context": 128,
+             "yarn_scale": "4", "context": 512},
+            {"ffn_mode": "moe", "moe_experts": 4, "moe_top_k": True},
+            {"attention_mode": "mla", "mla_content_width": 16,
+             "mla_positional_width": 8, "mla_kv_rank": 16, "mla_query_rank": 32,
+             "position_mode": "yarn", "yarn_original_context": 128,
+             "yarn_scale": 4.0, "context": 512},
+        )
+        for update in invalid:
+            with self.subTest(update=update), self.assertRaises(ValueError):
+                replace(baseline, **update)
+
 
 if __name__ == "__main__":
     unittest.main()
