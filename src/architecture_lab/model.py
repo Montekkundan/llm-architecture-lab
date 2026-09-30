@@ -43,7 +43,8 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        variance = x.float().square().mean(dim=-1, keepdim=True)
+        work_dtype = torch.float64 if x.dtype == torch.float64 else torch.float32
+        variance = x.to(work_dtype).square().mean(dim=-1, keepdim=True)
         return (x * torch.rsqrt(variance + self.eps).to(x.dtype)) * self.weight
 
 
@@ -200,7 +201,7 @@ class DecoderLM(nn.Module):
             raise ValueError("input_ids must be nonempty torch.long [batch, tokens]")
         if cache is not None and not use_cache:
             raise ValueError("A cache requires use_cache=True")
-        versions = tuple(parameter._version for parameter in self.parameters())
+        versions = tuple(tensor._version for tensor in (*self.parameters(), *self.buffers()))
         if cache is not None:
             if cache.owner != id(self) or cache.parameter_versions != versions:
                 raise ValueError("Cache belongs to another model or changed parameters")

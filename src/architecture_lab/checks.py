@@ -13,9 +13,14 @@ from .attention import LatentCache
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--labs", action="store_true", help="Run the seeded CPU mechanism checkpoints")
     parser.add_argument("--preset", default="pico-gqa",
                         choices=tuple(name for name, spec in PRESETS.items() if spec.scale == "teaching"))
     args = parser.parse_args()
+    if args.labs:
+        from .labs import lab_report
+        print(json.dumps(lab_report(), indent=2))
+        return
     spec = preset(args.preset)
     torch.manual_seed(7)
     model = build_model(spec).eval()

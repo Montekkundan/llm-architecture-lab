@@ -127,8 +127,10 @@ module and exact token prefix. The whole `DecoderLM` applies those cache guards.
 
 `TopKMoE` computes selected-expert softmax weights, normalizes them to one
 per token, and dispatches each token to `top_k` SwiGLU experts. No token is
-dropped. It has no shared expert, capacity limit, distributed all-to-all,
-load-balancing loss, or router stability training recipe. With `top_k=1`,
+dropped. The standalone constructor can add shared experts. Routing returns
+an optional balance-loss term and exposes a selection-only bias update; the
+caller chooses either training treatment. The decoder defaults keep both
+mechanisms inactive. Capacity limits and distributed all-to-all are not implemented. With `top_k=1`,
 normalizing only the selected logit makes the gate weight exactly one and
 gives the router no task-loss gradient; use `top_k=2` for this gradient demo.
 Top-k selection itself is discrete, so gradients flow through selected
@@ -136,9 +138,25 @@ logits, not through the choice of expert index.
 
 ## Scope and next lessons
 
-Fixed-scale YaRN, a readable MLA core, and sparse top-k dispatch now have
-selectable CPU teaching presets. Sliding/sparse/linear attention, shared-expert
-balancing, FlashAttention, FP8 and distributed execution remain future work.
+Fixed-scale YaRN, a readable MLA core, and sparse top-k dispatch have
+selectable CPU teaching presets. `labs.py` supplies separate differentiable
+references for the remaining mechanism lessons: local and selected-block
+masks, normalized recurrent kernel attention, QK normalization, explicit
+residual placements/gates, matched GELU/SwiGLU budgets, boundary-safe
+multi-token heads/loss, online softmax, and exact parameter/cost ledgers.
+Run `python -m architecture_lab.checks --labs` for seeded output checkpoints.
+`tests/test_labs.py` checks outputs, gradients, state, and causal invariants.
+
+These lab operators are not all exposed as `ModelSpec` decoder presets.
+The recurrent rule is ELU+1 normalized kernel attention, not Kimi KDA.
+Multi-token heads are independent horizon projections, not DeepSeek's
+sequential MTP modules. The online-softmax reference accepts a full mask and
+uses Python/autograd operations; it is not a fused FlashAttention kernel.
+Sparse masks are checked with a dense oracle, not a sparse GPU kernel.
+BF16 checks report numerical error, not a throughput/quality comparison.
+FP8, distributed dispatch, published-model checkpoints, long-context
+quality evaluations, and GPU performance experiments remain outside these
+CPU correctness references.
 See [lesson map](LESSON_MAP.md). No benchmark or published-model parity is
 claimed here.
 

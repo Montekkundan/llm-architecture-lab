@@ -1,6 +1,6 @@
 """Fixed-scale YaRN RoPE: NTK-by-parts frequencies plus attention scaling.
 
-This is a small reference for Peng et al., arXiv:2309.00071, equations 10–15.
+This is a small reference for Peng et al., arXiv:2309.00071, equations 17–22 (v2).
 It deliberately omits dynamic scaling, whose cache requires re-rotating old keys.
 """
 

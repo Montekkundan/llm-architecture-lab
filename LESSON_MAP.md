@@ -12,19 +12,19 @@ the claim. `Next exercise` means a lesson target, **not** a delivered feature.
 | 35 | MHA, MQA and GQA cache contracts | `spec.py:attention_kind`, `model.py:CausalAttention`; `python -m architecture_lab.checks --preset pico-gqa` | Implemented; PyTorch checks pending where torch absent |
 | 36 | MLA latent cache | `preset("pico-mla")`; `attention/mla.py`; `tests/test_model.py` | Reconstruction decoder, latent-cache accounting and CPU shape/backward/cache parity implemented |
 | 37 | Decoupled RoPE and absorbed MLA weights | `preset("pico-mla-absorbed")`; `attention/mla.py`; `tests/test_mechanisms.py` | Absorbed cached inference and double-precision parity implemented; latency/cost study next |
-| 38 | Sliding/global attention | Add causal window masks, mixed-layer schedule and exact-mask tests | Next exercise |
-| 39 | Block-sparse attention | Add selection operator and dense-reference/recall tests | Next exercise |
-| 40 | Linear/recurrent attention | Add recurrent state and step/sequence parity tests | Next exercise |
-| 41 | Norm placement and QK norm | Extend `DecoderBlock` with validated modes and gradient ablation | Next exercise |
-| 42 | Gates and residual scaling | Add controlled equal-budget stability experiment | Next exercise |
-| 43 | GELU versus SwiGLU versus expert FFN | Add matched-parameter variants and ablation | SwiGLU implemented; comparison next |
+| 38 | Sliding/global attention | `labs.py:causal_window_mask`; `tests/test_labs.py` | Absolute-position local/global mask and dense oracle implemented; hybrid decoder/cache eviction and quality lab remain separate |
+| 39 | Block-sparse attention | `labs.py:selected_block_mask`, `masked_attention`; `tests/test_labs.py` | Deterministic current-block selection, causality and dense-mask parity implemented; learned indexer/sparse kernel not claimed |
+| 40 | Linear/recurrent attention | `labs.py:LinearState`, `linear_attention`; `tests/test_labs.py` | ELU+1 normalized kernel recurrence and chunked output/gradient parity implemented; not KDA or DeltaNet |
+| 41 | Norm placement and QK norm | `labs.py:qk_normalize`, `residual_branch`; `tests/test_labs.py` | Feature-axis QK norm and four explicit residual equations implemented; model-scale gradient ablation next |
+| 42 | Gates and residual scaling | `labs.py:residual_branch`; `tests/test_labs.py` | Token gate/fixed or learned scale, zero-scale gradient experiment implemented; trained equal-budget comparison next |
+| 43 | GELU versus SwiGLU versus expert FFN | `labs.py:GeluFFN`, `model.py:SwiGLU`; `tests/test_labs.py` | Matched bias-free parameter count and module paths implemented; trained ablation next |
 | 44 | MoE routing | `preset("pico-moe")`, `preset("pico-mla-yarn-moe")`; `moe/router.py`; `tests/test_model.py` | Top-k decoder, combined MLA/YaRN/MoE path, CPU dispatch, weight conservation and gradients implemented; capacity/distributed routing next |
-| 45 | Shared experts and balancing | Add utilization metrics and controlled routing ablation | Next exercise |
-| 46 | Multi-token prediction | Add training head, weighted loss and inference test | Next exercise |
+| 45 | Shared experts and balancing | `moe/router.py:TopKMoE`; `tests/test_labs.py` | Optional shared path, unbiased gate weights, auxiliary balance term and selection-only bias update implemented; no distributed router recipe |
+| 46 | Multi-token prediction | `labs.py:MultiTokenHeads`, `multitoken_loss`; `tests/test_labs.py` | Independent horizon heads with document-boundary masks and weighted loss implemented; not DeepSeek sequential MTP or speculative sampler |
 | 47 | Cache across attention families | `model.py:ModelCache` and cached/full parity for MHA/MQA/GQA/YaRN/MLA/MoE | Selected CPU paths implemented; other families next |
-| 48 | IO-aware exact attention | Add online-softmax block reference, GPU kernel and profiler protocol | Next exercise |
-| 49 | Numerical precision | Add BF16/FP8 environment-gated tests and error report | FP32 checks only; rest next |
-| 50 | Parameter, FLOP, cache and communication costs | `spec.py:kv_cache_bytes`; add measured parameter/FLOP/mesh estimator | KV payload only; rest next |
+| 48 | IO-aware exact attention | `labs.py:online_attention`; `tests/test_labs.py` | Online-softmax tile reference with masked output/backward parity implemented; fused GPU kernel/profiling not claimed |
+| 49 | Numerical precision | `checks.py --labs`; `tests/test_labs.py` | Seeded BF16/FP32 logits error and FP32 reduction tests implemented; FP8/GPU throughput/held-out evaluation not claimed |
+| 50 | Parameter, FLOP, cache and communication costs | `labs.py:parameter_count`, `training_matmul_flops`, `ring_allreduce_bytes`; `spec.py:kv_cache_bytes` | Exact decoder parameter count and explicit 6ND/KV/ring transfer estimates implemented; measured GPU/mesh costs not claimed |
 
 The model tests are `tests/test_model.py` and require PyTorch. The
 dependency-free spec tests are `tests/test_spec.py`. Running all tests is the
