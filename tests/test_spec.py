@@ -54,8 +54,19 @@ class ModelSpecTests(unittest.TestCase):
                       if key not in {"position_mode", "yarn_original_context", "yarn_scale",
                                      "attention_mode", "mla_content_width", "mla_positional_width",
                                      "mla_kv_rank", "mla_query_rank", "mla_inference_mode", "ffn_mode",
-                                     "moe_experts", "moe_top_k"}}
+                                     "moe_experts", "moe_top_k", "mla_latent_norm",
+                                     "mla_mscale_scope", "moe_gate"}}
         self.assertEqual(ModelSpec.from_dict(old_fields), original)
+
+    def test_reference_aligned_options_roundtrip_and_need_their_mechanism(self):
+        logit = replace(preset("pico-mla-yarn-moe"), mla_latent_norm=True, mla_mscale_scope="logit",
+                        moe_gate="router_probability")
+        self.assertEqual(ModelSpec.from_dict(logit.to_dict()), logit)
+        for update in ({"mla_mscale_scope": "all"}, {"mla_latent_norm": 1}):
+            with self.subTest(update=update), self.assertRaises(ValueError):
+                replace(preset("pico-mla"), **update)
+        with self.assertRaises(ValueError):  # whole-logit mscale belongs to YaRN
+            replace(preset("pico-mla"), mla_mscale_scope="logit")
 
     def test_invalid_mechanism_combinations_are_rejected(self):
         baseline = preset("pico-dense")
@@ -76,6 +87,10 @@ class ModelSpecTests(unittest.TestCase):
             {"attention_mode": "mla", "mla_content_width": 16,
              "mla_positional_width": 8, "mla_kv_rank": 16, "mla_query_rank": 32,
              "mla_inference_mode": "unknown"},
+            {"mla_latent_norm": True},
+            {"mla_mscale_scope": "logit"},
+            {"moe_gate": "router_probability"},
+            {"ffn_mode": "moe", "moe_experts": 4, "moe_top_k": 1, "moe_gate": "hard"},
         )
         for update in invalid:
             with self.subTest(update=update), self.assertRaises(ValueError):
