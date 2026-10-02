@@ -18,6 +18,7 @@ from .spec import ModelSpec
 
 if TYPE_CHECKING:
     from .attention.mla import LatentCache
+    from .moe.router import Routing
 
 
 def apply_rope(x: torch.Tensor, positions: torch.Tensor, base: float) -> torch.Tensor:
@@ -70,7 +71,9 @@ class LayerCache:
 class ModelCache:
     layers: tuple[LayerCache | LatentCache, ...]
     tokens: torch.Tensor
-    owner: int
+    # A per-instance sentinel, compared by identity. id(model) is not safe: CPython reuses
+    # the id of a freed model, so a stale cache could be accepted by a later model.
+    owner: object
     parameter_versions: tuple[int, ...]
 
     def assert_prefix(self, tokens: torch.Tensor) -> None:
@@ -149,14 +152,16 @@ class DecoderBlock(nn.Module):
                 spec.mla_query_rank, rope_base=spec.rope_base,
                 inference_mode=spec.mla_inference_mode,
                 yarn_original_context=spec.yarn_original_context,
-                yarn_scale=spec.yarn_scale,
+                yarn_scale=spec.yarn_scale, latent_norm=spec.mla_latent_norm,
+                norm_eps=spec.eps, mscale_scope=spec.mla_mscale_scope,
             )
         else:
             self.attention = CausalAttention(spec)
         self.ffn_norm = RMSNorm(spec.width, spec.eps)
         if spec.ffn_mode == "moe":
             from .moe import TopKMoE
-            self.ffn = TopKMoE(spec.width, spec.ff_width, spec.moe_experts, spec.moe_top_k)
+            self.ffn = TopKMoE(spec.width, spec.ff_width, spec.moe_experts, spec.moe_top_k,
+                               gate=spec.moe_gate)
         else:
             self.ffn = SwiGLU(spec.width, spec.ff_width)
 
@@ -166,16 +171,35 @@ class DecoderBlock(nn.Module):
         positions: torch.Tensor,
         past: LayerCache | LatentCache | None = None,
         use_cache: bool = False,
-    ) -> tuple[torch.Tensor, LayerCache | LatentCache | None]:
+    ) -> tuple[torch.Tensor, LayerCache | LatentCache | None, Routing | None]:
         if self.attention_mode == "mla":
             attention_output, next_cache = self.attention(self.attention_norm(x), past, use_cache=use_cache)
         else:
             attention_output, next_cache = self.attention(self.attention_norm(x), positions, past, use_cache)
         x = x + attention_output
         ffn_output = self.ffn(self.ffn_norm(x))
+        routing = None
         if self.ffn_mode == "moe":
-            ffn_output, _ = ffn_output
-        return x + ffn_output, next_cache
+            ffn_output, routing = ffn_output
+        return x + ffn_output, next_cache, routing
+
+
+@dataclass(frozen=True)
+class DecoderRouting:
+    """Routing records of one decoder pass: one entry per block, None for a dense FFN."""
+
+    layers: tuple[Routing | None, ...]
+
+    @property
+    def counts(self) -> tuple[torch.Tensor, ...]:
+        """Expert assignment counts of the MoE blocks, in block order."""
+        return tuple(layer.counts for layer in self.layers if layer is not None)
+
+    @property
+    def auxiliary_loss(self) -> torch.Tensor:
+        """Sum over MoE blocks of E * sum_e(fraction_e * mean_probability_e); scale by alpha when training."""
+        losses = [layer.auxiliary_loss for layer in self.layers if layer is not None]
+        return torch.stack(losses).sum() if losses else torch.zeros(())
 
 
 class DecoderLM(nn.Module):
@@ -187,6 +211,7 @@ class DecoderLM(nn.Module):
         self.token_embedding = nn.Embedding(spec.vocab_size, spec.width)
         self.blocks = nn.ModuleList(DecoderBlock(spec) for _ in range(spec.layers))
         self.final_norm = RMSNorm(spec.width, spec.eps)
+        self._cache_owner = object()  # fresh per instance; deepcopy and pickle also create a new one
         self.lm_head = nn.Linear(spec.width, spec.vocab_size, bias=False)
         if spec.tie_embeddings:
             self.lm_head.weight = self.token_embedding.weight
@@ -196,14 +221,14 @@ class DecoderLM(nn.Module):
 
     def _run(
         self, input_ids: torch.Tensor, cache: ModelCache | None, use_cache: bool,
-    ) -> torch.Tensor | tuple[torch.Tensor, ModelCache]:
+    ) -> tuple[torch.Tensor, ModelCache | None, DecoderRouting]:
         if input_ids.ndim != 2 or input_ids.dtype != torch.long or input_ids.shape[0] < 1 or input_ids.shape[1] < 1:
             raise ValueError("input_ids must be nonempty torch.long [batch, tokens]")
         if cache is not None and not use_cache:
             raise ValueError("A cache requires use_cache=True")
         versions = tuple(tensor._version for tensor in (*self.parameters(), *self.buffers()))
         if cache is not None:
-            if cache.owner != id(self) or cache.parameter_versions != versions:
+            if cache.owner is not self._cache_owner or cache.parameter_versions != versions:
                 raise ValueError("Cache belongs to another model or changed parameters")
             if len(cache.layers) != len(self.blocks) or cache.tokens.shape[0] != input_ids.shape[0] or cache.tokens.device != input_ids.device:
                 raise ValueError("Cache shape or device differs")
@@ -215,21 +240,37 @@ class DecoderLM(nn.Module):
         positions = torch.arange(offset, offset + length, device=input_ids.device)
         x = self.token_embedding(input_ids)
         next_layers: list[LayerCache | LatentCache] = []
+        routing: list[Routing | None] = []
         for index, block in enumerate(self.blocks):
             previous = cache.layers[index] if cache is not None else None
-            x, next_layer = block(x, positions, previous, use_cache)
+            x, next_layer, block_routing = block(x, positions, previous, use_cache)
+            routing.append(block_routing)
             if next_layer is not None:
                 next_layers.append(next_layer)
         logits = self.lm_head(self.final_norm(x))
         if not use_cache:
-            return logits
+            return logits, None, DecoderRouting(tuple(routing))
         tokens = input_ids.clone() if cache is None else torch.cat((cache.tokens, input_ids), dim=1)
-        return logits, ModelCache(tuple(next_layers), tokens, id(self), versions)
+        return logits, ModelCache(tuple(next_layers), tokens, self._cache_owner, versions), DecoderRouting(tuple(routing))
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        result = self._run(input_ids, None, False)
-        assert isinstance(result, torch.Tensor)
-        return result
+    def forward(
+        self, input_ids: torch.Tensor, *, return_routing: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, DecoderRouting]:
+        """Logits [B,T,V]; with return_routing=True also the per-block MoE routing records.
+
+        The routing carries each block's Routing (indices, weights, counts, probabilities,
+        auxiliary_loss), so a trainer can add alpha * routing.auxiliary_loss to the task loss
+        and call update_selection_biases(routing, rate) after the optimizer step.
+        """
+        logits, _, routing = self._run(input_ids, None, False)
+        return (logits, routing) if return_routing else logits
+
+    @torch.no_grad()
+    def update_selection_biases(self, routing: DecoderRouting, rate: float) -> None:
+        """Apply the loss-free selection-bias update to every MoE block from its own counts."""
+        for block, record in zip(self.blocks, routing.layers):
+            if record is not None:
+                block.ffn.update_selection_bias(record.counts, rate)
 
     @torch.inference_mode()
     def forward_cached(
@@ -237,6 +278,6 @@ class DecoderLM(nn.Module):
     ) -> tuple[torch.Tensor, ModelCache]:
         if self.training:
             raise ValueError("Call model.eval() before cached inference")
-        result = self._run(input_ids, cache, True)
-        assert isinstance(result, tuple)
-        return result
+        logits, new_cache, _ = self._run(input_ids, cache, True)
+        assert new_cache is not None
+        return logits, new_cache
