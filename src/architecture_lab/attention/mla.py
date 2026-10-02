@@ -2,6 +2,13 @@
 
 DeepSeek-V2 equations 9–19 motivate the layout. Cached inference can either
 reconstruct K/V or absorb their up-projections into Q and the output weights.
+
+Two optional switches align the layer with the DeepSeek-V3 / Hugging Face layout and
+are off by default so the original arithmetic and parameter count are unchanged:
+latent_norm adds the q_a / kv_a RMSNorm on the compressed latents (the cache then
+stores the normalised KV latent), and mscale_scope="logit" replaces the positional-only
+YaRN scaling by softmax scale (c + r)^(-1/2) * m^2 over the whole logit with
+m = 0.1 ln(s) + 1, rotating Q/K without the multiplier.
 """
 
 from __future__ import annotations
@@ -12,7 +19,7 @@ import math
 import torch
 from torch import nn
 
-from ..model import apply_rope
+from ..model import RMSNorm, apply_rope
 from ..position import YarnRoPE
 
 
@@ -40,6 +47,9 @@ class LatentAttention(nn.Module):
         inference_mode: str = "reconstruct",
         yarn_original_context: int = 0,
         yarn_scale: float = 1.0,
+        latent_norm: bool = False,
+        norm_eps: float = 1e-6,
+        mscale_scope: str = "positional",
     ) -> None:
         super().__init__()
         if min(width, heads, content_width, positional_width, kv_rank, query_rank) <= 0:
@@ -50,13 +60,19 @@ class LatentAttention(nn.Module):
             raise ValueError("inference_mode must be reconstruct or absorbed")
         if (yarn_original_context == 0) != (yarn_scale == 1.0):
             raise ValueError("YaRN requires both an original context and a scale > 1")
+        if mscale_scope not in {"positional", "logit"}:
+            raise ValueError("mscale_scope must be positional or logit")
+        if mscale_scope == "logit" and not yarn_original_context:
+            raise ValueError("mscale_scope='logit' requires YaRN")
         self.heads = heads
         self.content_width = content_width
         self.positional_width = positional_width
         self.rope_base = rope_base
         self.inference_mode = inference_mode
+        self.mscale_scope = mscale_scope
         self.yarn = (YarnRoPE(positional_width, yarn_original_context, yarn_scale,
-                              base=rope_base) if yarn_original_context else None)
+                              base=rope_base, apply_multiplier=mscale_scope == "positional")
+                     if yarn_original_context else None)
         self.q_down = nn.Linear(width, query_rank, bias=False)
         self.q_content = nn.Linear(query_rank, heads * content_width, bias=False)
         self.q_position = nn.Linear(query_rank, heads * positional_width, bias=False)
@@ -65,6 +81,8 @@ class LatentAttention(nn.Module):
         self.v_content = nn.Linear(kv_rank, heads * content_width, bias=False)
         self.k_position = nn.Linear(width, positional_width, bias=False)
         self.output = nn.Linear(heads * content_width, width, bias=False)
+        self.q_norm = RMSNorm(query_rank, norm_eps) if latent_norm else None
+        self.kv_norm = RMSNorm(kv_rank, norm_eps) if latent_norm else None
 
     def forward(
         self,
@@ -86,6 +104,8 @@ class LatentAttention(nn.Module):
             raise ValueError("Past cache shape, dtype or device differs")
         positions = torch.arange(offset, offset + length, device=x.device)
         query_latent = self.q_down(x)
+        if self.q_norm is not None:
+            query_latent = self.q_norm(query_latent)
         q_content = self.q_content(query_latent).view(batch, length, self.heads, self.content_width).transpose(1, 2)
         q_position = self.q_position(query_latent).view(batch, length, self.heads, self.positional_width).transpose(1, 2)
         if self.yarn is None:
@@ -94,6 +114,8 @@ class LatentAttention(nn.Module):
             q_position = self.yarn(q_position, positions)
 
         latent = self.kv_down(x)
+        if self.kv_norm is not None:
+            latent = self.kv_norm(latent)  # normalised before caching, as in DeepSeek-V3
         positional_keys = self.k_position(x).unsqueeze(1)
         if self.yarn is None:
             positional_keys = apply_rope(positional_keys, positions, self.rope_base)
@@ -113,6 +135,8 @@ class LatentAttention(nn.Module):
             content_scores = q_content @ k_content.transpose(-2, -1)
         position_scores = q_position @ positional_keys.transpose(-2, -1)
         scores = (content_scores + position_scores) / math.sqrt(self.content_width + self.positional_width)
+        if self.mscale_scope == "logit":
+            scores = scores * self.yarn.attention_multiplier ** 2  # whole-logit mscale^2
         forbidden = torch.arange(total, device=x.device)[None, None, None, :] > positions[None, None, :, None]
         probabilities = scores.masked_fill(forbidden, float("-inf")).softmax(-1)
         if absorbed:
