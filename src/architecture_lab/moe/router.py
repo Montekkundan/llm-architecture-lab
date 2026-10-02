@@ -13,18 +13,32 @@ from ..model import SwiGLU
 @dataclass(frozen=True)
 class Routing:
     indices: torch.Tensor  # [..., top_k]
-    weights: torch.Tensor  # [..., top_k], sums to one per token
+    weights: torch.Tensor  # [..., top_k]; sums to one per token unless gate="router_probability"
     counts: torch.Tensor  # [num_experts], counts assignments rather than unique tokens
     probabilities: torch.Tensor  # [..., experts], unbiased full-router softmax
     auxiliary_loss: torch.Tensor  # E * sum(selection fraction * mean probability)
 
 
 class TopKMoE(nn.Module):
+    """Token-choice top-k MoE.
+
+    gate="selected_softmax" (default): w_k = softmax over the k selected logits, so the
+    weights sum to one. For top_k=1 this is exactly 1 and its derivative p(1 - p) is
+    exactly 0, so the task loss sends no gradient to the router; only the auxiliary
+    balance loss (which reads the full-router probabilities) trains it.
+    gate="router_probability": w_k = full-router softmax probability of the selected
+    expert, not renormalised (Switch Transformer top-1 style), so the router receives a
+    task gradient for every top_k. The weights then sum to less than one.
+    """
+
     def __init__(self, width: int, ff_width: int, experts: int, top_k: int,
-                 *, shared_experts: int = 0) -> None:
+                 *, shared_experts: int = 0, gate: str = "selected_softmax") -> None:
         super().__init__()
         if min(width, ff_width, experts, top_k) <= 0 or top_k > experts:
             raise ValueError("Require positive dimensions and 1 <= top_k <= experts")
+        if gate not in {"selected_softmax", "router_probability"}:
+            raise ValueError("gate must be selected_softmax or router_probability")
+        self.gate = gate
         self.router = nn.Linear(width, experts, bias=False)
         self.experts = nn.ModuleList(SwiGLU(width, ff_width) for _ in range(experts))
         if type(shared_experts) is not int or shared_experts < 0:
@@ -41,8 +55,11 @@ class TopKMoE(nn.Module):
             raise ValueError("At least one token is required")
         logits = self.router(tokens)
         indices = (logits + self.selection_bias).topk(self.top_k, dim=-1).indices
-        weights = logits.gather(-1, indices).softmax(dim=-1)
         probabilities = logits.softmax(dim=-1)
+        if self.gate == "selected_softmax":
+            weights = logits.gather(-1, indices).softmax(dim=-1)
+        else:
+            weights = probabilities.gather(-1, indices)
         result = torch.zeros_like(tokens)
         for expert_id, expert in enumerate(self.experts):
             token_idx, slot_idx = (indices == expert_id).nonzero(as_tuple=True)
