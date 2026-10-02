@@ -218,6 +218,8 @@ def parameter_count(spec: ModelSpec) -> int:
     else:
         c, r, p, a = spec.mla_content_width, spec.mla_positional_width, spec.mla_kv_rank, spec.mla_query_rank
         attention = d * a + a * h * (c + r) + d * p + 2 * p * h * c + d * r + h * c * d
+        if spec.mla_latent_norm:
+            attention += a + p  # RMSNorm gains on the query and KV latents
     ffn = 3 * d * f
     if spec.ffn_mode == 'moe':
         ffn = spec.moe_experts * ffn + d * spec.moe_experts
