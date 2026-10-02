@@ -60,7 +60,12 @@ throughput, or full implementation details. See [lesson map](LESSON_MAP.md).
 The executable checks compare full-sequence logits to three cached chunks,
 verify cache shapes, check RoPE norm and relative-position identities, ensure
 future tokens cannot change earlier outputs, and backpropagate through all
-parameters. A cache belongs to one unchanged model and token prefix. These
+parameters. `tests/test_oracles.py` adds independent references for the attention
+scale and GQA head grouping (a per-head loop and torch SDPA), the YaRN frequencies and
+multiplier, MLA against a naive concatenated Q/K, and the MoE balance-loss factor.
+A cache belongs to one unchanged model instance and token prefix: the owner is a
+per-instance sentinel compared by identity (a freed model's `id` can be reused by a
+later one, a deep copy gets its own sentinel), plus a parameter-version check. These
 are numerical and structural tests, not performance measurements.
 
 ## Selectable mechanism references
@@ -103,13 +108,27 @@ output, routing = moe(x)
 assert routing.counts.sum().item() == 2 * x.shape[0] * x.shape[1]
 ```
 
-`YarnRoPE` implements a **fixed** scale: the paper's NTK-by-parts frequency
-ramp using rotations in the original context, plus its attention multiplier
-on both Q and K. It does not implement Dynamic-YaRN, fine-tuning, or a
-length-extrapolation evaluation. Fix the scale for a cached decode; changing
-it mid-cache would require re-rotating earlier keys. The paper's suggested
-`alpha=1`, `beta=32`, and attention formula were fitted for LLaMA-family
-experiments, not validated here as universal settings.
+`YarnRoPE` implements a **fixed** scale: NTK-by-parts frequencies plus the paper's
+attention multiplier `0.1 ln(s) + 1` on both Q and K. It does not implement
+Dynamic-YaRN, fine-tuning, or a length-extrapolation evaluation. Fix the scale for a
+cached decode; changing it mid-cache would require re-rotating earlier keys. The
+paper's suggested `alpha=1`, `beta=32`, and attention formula were fitted for
+LLaMA-family experiments, not validated here as universal settings.
+
+The frequency ramp has two forms. The default, `ramp="dimension"`, is the one in the
+authors' released code and in Hugging Face `transformers`
+(`_compute_yarn_parameters`): the extrapolation weight falls linearly in the pair index
+between `low = floor(d(beta))` and `high = ceil(d(alpha))`, where
+`d(r) = D ln(L / (2 pi r)) / (2 ln b)` is the pair that completes `r` turns over the
+original context `L`. `ramp="rotations"` is the paper's printed equation, linear in the
+rotation count `L theta / (2 pi)`. When the ramp saturates at both ends they agree on the
+fastest pairs (unchanged) and on the slowest pairs (interpolated by `1/s`) and differ only
+between the bounds, which matters when a checkpoint fine-tuned with the reference code is ported. The default
+changed from `rotations` to `dimension`; the endpoint frequencies printed by lesson 34
+(`first/last frequencies 1.0 7.906e-05`) and the multiplier `1.13862944` are the same
+under both. `tests/test_oracles.py` compares the default with a transcription of the
+reference code and, when `transformers` is installed, with its YaRN init function.
+`apply_multiplier=False` leaves the multiplier to the caller (see MLA below).
 
 `LatentAttention` implements low-rank Q and joint KV projections, a shared
 decoupled RoPE key, causal masking, and a cache of KV latents plus positional
@@ -125,16 +144,50 @@ measurements. Its standalone `LatentCache` has no
 model-owner/parameter-version guard; use it only with the same unchanged
 module and exact token prefix. The whole `DecoderLM` applies those cache guards.
 
+Two switches align the layer with DeepSeek-V3 as implemented in Hugging Face
+`DeepseekV3Attention` and are **off by default**, so parameter counts and the printed
+lesson numbers do not change. `latent_norm=True` (`mla_latent_norm` in `ModelSpec`)
+adds the `q_a` and `kv_a` RMSNorm on the compressed latents; the cache then stores
+the normalised KV latent. `mscale_scope="logit"` (`mla_mscale_scope`, needs YaRN)
+rotates Q/K without the YaRN multiplier and multiplies the whole logit by
+`(0.1 ln s + 1)^2`, i.e. softmax scale `(c + r)^(-1/2) * mscale^2` over content plus
+positional parts, as DeepSeek-V3 does when `rope_scaling` carries an `mscale`. The
+default `mscale_scope="positional"` scales only the positional score by the squared
+multiplier. When `transformers` is installed, a test compares the layer (latent norm,
+YaRN, whole logit) with Hugging Face `DeepseekV3Attention`; they agree to about 1e-7
+relative, the float32 precision of Hugging Face's cos/sin tables, and the
+positional-only scope does not match it. The test is skipped if the package or its
+module API is unavailable.
+
 `TopKMoE` computes selected-expert softmax weights, normalizes them to one
 per token, and dispatches each token to `top_k` SwiGLU experts. No token is
 dropped. The standalone constructor can add shared experts. Routing returns
 an optional balance-loss term and exposes a selection-only bias update; the
 caller chooses either training treatment. The decoder defaults keep both
-mechanisms inactive. Capacity limits and distributed all-to-all are not implemented. With `top_k=1`,
-normalizing only the selected logit makes the gate weight exactly one and
-gives the router no task-loss gradient; use `top_k=2` for this gradient demo.
+mechanisms inactive. Capacity limits and distributed all-to-all are not implemented.
+The selection bias is added to the router **logits** before top-k, not to
+post-activation affinities as in DeepSeek-V3's sigmoid routing; gate weights always use
+the unbiased scores. The balance loss is `E * sum_e(f_e * P_e)` with `f_e` the share of
+assignments (`counts / (tokens * top_k)`), so perfectly balanced routing gives exactly
+1.0; Hugging Face's Mixtral `load_balancing_loss_func` divides by tokens instead and
+returns `top_k` times this value (equal for `top_k=1`).
+
+With `top_k=1` and the default `gate="selected_softmax"`, normalizing only the selected
+logit makes the gate weight exactly one and its derivative exactly zero, so the router
+receives **no task-loss gradient** (only the balance loss reaches it); use `top_k=2` for
+the gradient demo. `gate="router_probability"` (`moe_gate` in `ModelSpec`) instead
+multiplies the selected expert by its full-router probability, Switch Transformer style,
+which trains a top-1 router; its weights sum to less than one.
 Top-k selection itself is discrete, so gradients flow through selected
 logits, not through the choice of expert index.
+
+`DecoderLM(ids, return_routing=True)` returns `(logits, DecoderRouting)`; the default call
+still returns the logits tensor. `DecoderRouting.layers` holds one `Routing` (indices,
+weights, counts, probabilities, auxiliary loss) per block, `None` for dense blocks;
+`.auxiliary_loss` sums the MoE blocks, and `model.update_selection_biases(routing, rate)`
+applies the loss-free bias update from each block's own counts. A trainer would add
+`alpha * routing.auxiliary_loss` to the task loss. Cached decoding (`forward_cached`)
+does not return routing.
 
 ## Scope and next lessons
 
@@ -168,10 +221,10 @@ claimed here.
   attention and the MHA↔MQA spectrum.
 - Shazeer, [One Write-Head Is All You Need](https://arxiv.org/abs/1911.02150):
   multi-query decoding and cache motivation.
-- Meta, [Llama 3 model SKU definitions](https://github.com/meta-llama/llama-models/blob/main/models/sku_list.py)
-  and [model code](https://github.com/meta-llama/llama-models/blob/main/models/llama3/model.py):
+- Meta, [Llama 3 model SKU definitions](https://github.com/meta-llama/llama-models/blob/0e0b8c519242d5833d8c11bffc1232b77ad7f301/models/sku_list.py)
+  and [model code](https://github.com/meta-llama/llama-models/blob/0e0b8c519242d5833d8c11bffc1232b77ad7f301/models/llama3/model.py):
   published 8B dimensions and SwiGLU width derivation. The 8K context is
-  stated in Meta's [model card](https://github.com/meta-llama/llama-models/blob/main/models/llama3/MODEL_CARD.md).
+  stated in Meta's [model card](https://github.com/meta-llama/llama-models/blob/0e0b8c519242d5833d8c11bffc1232b77ad7f301/models/llama3/MODEL_CARD.md).
 - Peng et al., [YaRN: Efficient Context Window Extension of Large Language Models](https://arxiv.org/pdf/2309.00071), sections 3.2–3.4:
   NTK-by-parts frequency ramp, attention scaling, and the dynamic-cache caveat.
 - DeepSeek-AI, [DeepSeek-V2](https://arxiv.org/pdf/2405.04434), section 2.1,
