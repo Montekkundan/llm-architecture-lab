@@ -38,6 +38,9 @@ class ModelSpec:
     ffn_mode: str = "swiglu"
     moe_experts: int = 0
     moe_top_k: int = 0
+    mla_latent_norm: bool = False
+    mla_mscale_scope: str = "positional"
+    moe_gate: str = "selected_softmax"
 
     def __post_init__(self) -> None:
         if self.schema_version != SCHEMA_VERSION:
@@ -78,22 +81,29 @@ class ModelSpec:
         mla_fields = (self.mla_content_width, self.mla_positional_width,
                       self.mla_kv_rank, self.mla_query_rank)
         if self.attention_mode == "standard":
-            if any(mla_fields) or self.mla_inference_mode != "reconstruct":
+            if (any(mla_fields) or self.mla_inference_mode != "reconstruct"
+                    or self.mla_latent_norm or self.mla_mscale_scope != "positional"):
                 raise ValueError("Standard attention cannot carry MLA dimensions")
         elif self.attention_mode == "mla":
             if (any(type(value) is not int or value <= 0 for value in mla_fields)
                     or self.mla_positional_width % 2 or self.kv_heads != self.heads
                     or self.mla_inference_mode not in {"reconstruct", "absorbed"}):
                 raise ValueError("MLA needs positive ranks, even positional width, and a valid inference mode")
+            if type(self.mla_latent_norm) is not bool or self.mla_mscale_scope not in {"positional", "logit"}:
+                raise ValueError("mla_latent_norm must be boolean and mla_mscale_scope positional or logit")
+            if self.mla_mscale_scope == "logit" and self.position_mode != "yarn":
+                raise ValueError("mla_mscale_scope='logit' needs position_mode='yarn'")
         else:
             raise ValueError("attention_mode must be standard or mla")
         if self.ffn_mode == "swiglu":
-            if self.moe_experts or self.moe_top_k:
+            if self.moe_experts or self.moe_top_k or self.moe_gate != "selected_softmax":
                 raise ValueError("Dense SwiGLU cannot carry MoE routing settings")
         elif self.ffn_mode == "moe":
             if (type(self.moe_experts) is not int or type(self.moe_top_k) is not int
                     or self.moe_experts < 2 or not 1 <= self.moe_top_k <= self.moe_experts):
                 raise ValueError("MoE needs at least two experts and a valid top_k")
+            if self.moe_gate not in {"selected_softmax", "router_probability"}:
+                raise ValueError("moe_gate must be selected_softmax or router_probability")
         else:
             raise ValueError("ffn_mode must be swiglu or moe")
 
